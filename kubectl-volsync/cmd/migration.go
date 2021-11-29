@@ -19,12 +19,86 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 )
 
 // MigrationRelationship defines the "type" of migration Relationships
-const MigrationRelationship RelationshipType = "migration"
+const MigrationRelationshipType RelationshipType = "migration"
+
+// migrationRelationship holds the config state for migration-type
+// relationships
+type migrationRelationship struct {
+	Relationship
+	data migrationRelationshipData
+}
+
+// migrationRelationshipData is the state that will be saved to the
+// relationship config file
+type migrationRelationshipData struct {
+	Version     int
+	Source      *migrationRelationshipSource
+	Destination *migrationRelationshipDestination
+}
+
+type migrationRelationshipSource struct {
+	// Volume to be migrated
+	Volume string
+	// Total volume size
+	Size *resource.Quantity
+}
+
+type migrationRelationshipDestination struct {
+	// Cluster context name
+	Cluster string
+	// Namespace on destination cluster
+	Namespace string
+	// Name of PVC being replicated
+	PVCName string
+	// PVC object
+	PVC *v1.PersistentVolumeClaim
+	// Name of the migrationDestination object
+	MDName string
+	// client object associated with a cluster
+	clientObject client.Client
+	// Name of Secret holding SSH keys
+	SSHKeyName string
+	// Parameters for the migrationDestination
+	Destination volsyncv1alpha1.ReplicationDestinationRsyncSpec
+}
+
+func (mr *migrationRelationship) Save() error {
+	mr.Set("data", mr.data)
+	// resource.Quantity doesn't properly encode, so we need to do it manually
+	/*
+		if mr.data.Source != nil && mr.data.Source.Source.Capacity != nil {
+			mr.Set("data.source.source.capacity", mr.data.Source.Source.Capacity.String())
+		}
+	*/
+	if mr.data.Destination != nil && mr.data.Destination.Destination.Capacity != nil {
+		mr.Set("data.destination.destination.capacity", mr.data.Destination.Destination.Capacity.String())
+	}
+	return mr.Relationship.Save()
+}
+
+func newmigrationRelationship(cmd *cobra.Command) (*migrationRelationship, error) {
+	r, err := CreateRelationshipFromCommand(cmd, MigrationRelationshipType)
+	if err != nil {
+		return nil, err
+	}
+
+	return &migrationRelationship{
+		Relationship: *r,
+		data: migrationRelationshipData{
+			Version: 1,
+		},
+	}, nil
+}
 
 // migrationCmd represents the migration command
 var migrationCmd = &cobra.Command{
