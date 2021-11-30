@@ -139,7 +139,7 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 
 	cm, err := cmd.Flags().GetString("copymethod")
 	if err != nil {
-		klog.Info("Copy method not provided, defaulting to copymethod: Snapshot")
+		klog.Info("Copy method not provided, defaulting to copymethod: \"Snapshot\"")
 		cm = "Snapshot"
 	}
 
@@ -180,7 +180,7 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 
 		accessMode, err := cmd.Flags().GetString("accessmodes")
 		if err != nil || accessMode == "" {
-			klog.Info("access mode not provided, defaulting to accessMode: ReadWriteOnce")
+			klog.Info("access mode not provided, defaulting to accessMode: \"ReadWriteOnce\"")
 			accessMode = "ReadWriteOnce"
 		}
 
@@ -209,6 +209,8 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 	}
 	mrd.Destination.ServiceType = (*v1.ServiceType)(&serviceType)
 
+	mrd.MDName = mrd.Namespace + "-" + mrd.PVCName + "-migration-dest"
+
 	return mrd, nil
 }
 
@@ -221,13 +223,13 @@ func createNamespace(ctx context.Context, mrd *migrationRelationshipDestination)
 
 	if err := mrd.clientObject.Create(ctx, ns); err != nil {
 		if kerrs.IsAlreadyExists(err) {
-			klog.Infof("Namespace: %s already present, proceeding with this namespace",
+			klog.Infof("Namespace: \"%s\" already present, proceeding with this namespace",
 				mrd.Namespace)
 			return nil
 		}
 		return err
 	}
-	klog.Infof("Created destination namespace: %s", mrd.Namespace)
+	klog.Infof("Created destination namespace: \"%s\"", mrd.Namespace)
 	return nil
 }
 
@@ -252,7 +254,7 @@ func createDestinationPVC(ctx context.Context,
 		return nil, err
 	}
 
-	klog.Infof("Created destination PVC: %s", mrd.PVCName)
+	klog.Infof("Created destination PVC: \"%s\"", mrd.PVCName)
 	return destPVC, nil
 }
 
@@ -281,10 +283,9 @@ func CreateDestination(ctx context.Context, mrd *migrationRelationshipDestinatio
 		ServiceType: mrd.Destination.ServiceType,
 	}
 
-	rdName := mrd.Namespace + "-" + mrd.PVCName + "-replication-dest"
 	rd := &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      rdName,
+			Name:      mrd.MDName,
 			Namespace: mrd.Namespace,
 		},
 		Spec: volsyncv1alpha1.ReplicationDestinationSpec{
@@ -294,7 +295,7 @@ func CreateDestination(ctx context.Context, mrd *migrationRelationshipDestinatio
 	if err := mrd.clientObject.Create(ctx, rd); err != nil {
 		return err
 	}
-	klog.V(0).Infof("ReplicationDestination: %s created in namespace %s", rdName, mrd.Namespace)
+	klog.Infof("ReplicationDestination: \"%s\" created in namespace: \"%s\"", mrd.MDName, mrd.Namespace)
 
 	return nil
 }
