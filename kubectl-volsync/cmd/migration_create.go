@@ -60,6 +60,8 @@ var migrationCreateCmd = &cobra.Command{
 func init() {
 	migrationCmd.AddCommand(migrationCreateCmd)
 
+	migrationCreateCmd.Flags().String("copymethod", "",
+		"Copy method used to copy the data from source to destination PVC")
 	migrationCreateCmd.Flags().String("accessmodes", "",
 		"accessMode of the PVC to create. viz: ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod")
 	migrationCreateCmd.Flags().String("capacity", "", "size of the PVC to create in Gi ex: 10Gi")
@@ -138,7 +140,7 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 	mrd := &migrationRelationshipDestination{}
 
 	cm, err := cmd.Flags().GetString("copymethod")
-	if err != nil {
+	if err != nil || cm == "" {
 		klog.Info("Copy method not provided, defaulting to copymethod: \"Snapshot\"")
 		cm = "Snapshot"
 	}
@@ -147,6 +149,7 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 	if mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodNone &&
 		mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodClone &&
 		mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodSnapshot {
+		klog.Infof("unsupported copymethod: %v", mrd.Destination.CopyMethod)
 		return nil, fmt.Errorf("unsupported copymethod: %v", mrd.Destination.CopyMethod)
 	}
 
@@ -193,6 +196,13 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 		}
 		accessModes := []v1.PersistentVolumeAccessMode{v1.PersistentVolumeAccessMode(accessMode)}
 		mrd.Destination.AccessModes = accessModes
+
+		storageClass, err := cmd.Flags().GetString("storageclass")
+		if err != nil || storageClass == "" {
+			klog.Infof("storage class not provided, binding to default storage class")
+		}
+
+		mrd.Destination.StorageClassName = &storageClass
 	}
 
 	serviceType, err := cmd.Flags().GetString("servicetype")
@@ -235,19 +245,38 @@ func createNamespace(ctx context.Context, mrd *migrationRelationshipDestination)
 
 func createDestinationPVC(ctx context.Context,
 	mrd *migrationRelationshipDestination) (*v1.PersistentVolumeClaim, error) {
-	destPVC := &v1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      mrd.PVCName,
-			Namespace: mrd.Namespace,
-		},
-		Spec: v1.PersistentVolumeClaimSpec{
-			AccessModes: mrd.Destination.AccessModes,
-			Resources: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					v1.ResourceStorage: *mrd.Destination.Capacity,
+	var destPVC *v1.PersistentVolumeClaim
+	if *mrd.Destination.StorageClassName == "" {
+		destPVC = &v1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      mrd.PVCName,
+				Namespace: mrd.Namespace,
+			},
+			Spec: v1.PersistentVolumeClaimSpec{
+				AccessModes: mrd.Destination.AccessModes,
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceStorage: *mrd.Destination.Capacity,
+					},
 				},
 			},
-		},
+		}
+	} else {
+		destPVC = &v1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      mrd.PVCName,
+				Namespace: mrd.Namespace,
+			},
+			Spec: v1.PersistentVolumeClaimSpec{
+				AccessModes:      mrd.Destination.AccessModes,
+				StorageClassName: mrd.Destination.StorageClassName,
+				Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceStorage: *mrd.Destination.Capacity,
+					},
+				},
+			},
+		}
 	}
 
 	if err := mrd.clientObject.Create(ctx, destPVC); err != nil {
