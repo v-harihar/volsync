@@ -19,7 +19,6 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 
@@ -40,15 +39,7 @@ type migrationRelationship struct {
 // relationship config file
 type migrationRelationshipData struct {
 	Version     int
-	Source      *migrationRelationshipSource
 	Destination *migrationRelationshipDestination
-}
-
-type migrationRelationshipSource struct {
-	// Volume to be migrated
-	Volume string
-	// Total volume size
-	Size *resource.Quantity
 }
 
 type migrationRelationshipDestination struct {
