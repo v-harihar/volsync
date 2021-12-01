@@ -19,11 +19,9 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 )
@@ -60,12 +58,8 @@ type migrationRelationshipDestination struct {
 	Namespace string
 	// Name of PVC being replicated
 	PVCName string
-	// PVC object
-	PVC *v1.PersistentVolumeClaim
 	// Name of the migrationDestination object
 	MDName string
-	// client object associated with a cluster
-	clientObject client.Client
 	// Name of Secret holding SSH keys
 	SSHKeyName string
 	// Parameters for the migrationDestination
@@ -75,13 +69,19 @@ type migrationRelationshipDestination struct {
 func (mr *migrationRelationship) Save() error {
 	mr.Set("data", mr.data)
 	// resource.Quantity doesn't properly encode, so we need to do it manually
-	/*
-		if mr.data.Source != nil && mr.data.Source.Source.Capacity != nil {
-			mr.Set("data.source.source.capacity", mr.data.Source.Source.Capacity.String())
-		}
-	*/
 	if mr.data.Destination != nil && mr.data.Destination.Destination.Capacity != nil {
-		mr.Set("data.destination.destination.capacity", mr.data.Destination.Destination.Capacity.String())
+		mr.Set("data.destination.Cluster", mr.data.Destination.Cluster)
+		mr.Set("data.destination.Namespace", mr.data.Destination.Namespace)
+		mr.Set("data.destination.PVCName", mr.data.Destination.PVCName)
+		mr.Set("data.destination.MDName", mr.data.Destination.MDName)
+		mr.Set("data.destination.spec.ServiceType", mr.data.Destination.Destination.ServiceType)
+		mr.Set("data.destination.spec.AccessModes", mr.data.Destination.Destination.AccessModes)
+		mr.Set("data.destination.spec.CopyMethod", mr.data.Destination.Destination.CopyMethod)
+		mr.Set("data.destination.spec.Capacity", mr.data.Destination.Destination.Capacity.String())
+		mr.Set("data.destination.spec.StorageClassName", mr.data.Destination.Destination.StorageClassName)
+		mr.Set("data.destination.rsync.Address", mr.data.Destination.Destination.Address)
+		mr.Set("data.destination.rsync.Port", mr.data.Destination.Destination.Port)
+		mr.Set("data.destination.rsync.SSHKeys", mr.data.Destination.Destination.SSHKeys)
 	}
 	return mr.Relationship.Save()
 }

@@ -17,8 +17,8 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 package cmd
 
 import (
-	"context"
 	"fmt"
+	"time"
 
 	"github.com/spf13/cobra"
 	v1 "k8s.io/api/core/v1"
@@ -26,15 +26,21 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
 )
 
 type migrationCreate struct {
 	cobra.Command
+	// client object associated with a cluster
+	clientObject client.Client
+	// PVC object associated with pvcName
+	PVC *v1.PersistentVolumeClaim
 }
 
 // migrationCreateCmd represents the create command
@@ -60,16 +66,16 @@ var migrationCreateCmd = &cobra.Command{
 func init() {
 	migrationCmd.AddCommand(migrationCreateCmd)
 
-	migrationCreateCmd.Flags().String("copymethod", "",
-		"Copy method used to copy the data from source to destination PVC")
-	migrationCreateCmd.Flags().String("accessmodes", "",
+	migrationCreateCmd.Flags().String("copymethod", "Direct",
+		"Copy method used to copy the data from source to destination PVC viz: Direct, Snapshot")
+	migrationCreateCmd.Flags().String("accessmodes", "ReadWriteOnce",
 		"accessMode of the PVC to create. viz: ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod")
 	migrationCreateCmd.Flags().String("capacity", "", "size of the PVC to create in Gi ex: 10Gi")
 	migrationCreateCmd.Flags().String("pvcname", "", "name of the PVC to create or use: [context/]namespace/name")
 	cobra.CheckErr(migrationCreateCmd.MarkFlagRequired("pvcname"))
 	migrationCreateCmd.Flags().String("storageclass", "", "StorageClass name for the PVC")
 	migrationCreateCmd.Flags().String("servicetype", "",
-		"Service Type or ingress methods for a service. viz: ClusterIP, NodePort, LoadBalancer")
+		"Service Type or ingress methods for a service. viz: ClusterIP, LoadBalancer")
 	cobra.CheckErr(migrationCreateCmd.MarkFlagRequired("servicetype"))
 }
 
@@ -101,55 +107,49 @@ func (cmd *migrationCreate) Run() error {
 	if err != nil {
 		return err
 	}
-
+	// build struct migrationRelationshipDestination from cmd line args
+	mrd, err := newMigrationRelationshipDestination(cmd)
+	if err != nil {
+		return err
+	}
+	// create namespace if does not exist
+	err = createNamespace(cmd, mrd)
+	if err != nil {
+		return err
+	}
+	// create destination PVC if does not exist
+	if cmd.PVC == nil {
+		cmd.PVC, err = createDestinationPVC(cmd, mrd)
+		if err != nil {
+			return err
+		}
+	}
+	// create migration destination
+	err = createDestination(cmd, mrd)
+	if err != nil {
+		return err
+	}
+	// save the destination details into config file
+	m.data.Destination = mrd
 	if err = m.Save(); err != nil {
 		return fmt.Errorf("unable to save relationship configuration: %w", err)
 	}
-
-	// build struct migrationRelationshipDestination from cmd line args
-	mrd, err := newMigrationRelationshipDestination(&cmd.Command)
-	if err != nil {
-		return nil
-	}
-
-	// create namespace if does not exist
-	err = createNamespace(cmd.Context(), mrd)
-	if err != nil {
-		return nil
-	}
-
-	// create destination PVC if does not exist
-	if mrd.PVC == nil {
-		mrd.PVC, err = createDestinationPVC(cmd.Context(), mrd)
-		if err != nil {
-			return nil
-		}
-	}
-
-	// create replication destination
-	err = CreateDestination(cmd.Context(), mrd)
-	if err != nil {
-		return nil
-	}
-
 	return nil
 }
 
 //nolint:funlen
-func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelationshipDestination, error) {
+func newMigrationRelationshipDestination(mc *migrationCreate) (*migrationRelationshipDestination, error) {
+	cmd := &mc.Command
 	mrd := &migrationRelationshipDestination{}
 
 	cm, err := cmd.Flags().GetString("copymethod")
-	if err != nil || cm == "" {
-		klog.Info("Copy method not provided, defaulting to copymethod: \"Snapshot\"")
-		cm = "Snapshot"
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch the copy method, err = %w", err)
 	}
-
 	mrd.Destination.CopyMethod = volsyncv1alpha1.CopyMethodType(cm)
-	if mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodNone &&
+	if mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodDirect &&
 		mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodClone &&
 		mrd.Destination.CopyMethod != volsyncv1alpha1.CopyMethodSnapshot {
-		klog.Infof("unsupported copymethod: %v", mrd.Destination.CopyMethod)
 		return nil, fmt.Errorf("unsupported copymethod: %v", mrd.Destination.CopyMethod)
 	}
 
@@ -157,7 +157,6 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 	if err != nil {
 		return nil, err
 	}
-
 	xcr, err := ParseXClusterName(pvcname)
 	if err != nil {
 		return nil, err
@@ -165,33 +164,29 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 	mrd.PVCName = xcr.Name
 	mrd.Namespace = xcr.Namespace
 
-	clientObject, err := newClient(mrd.Cluster)
+	mc.clientObject, err = newClient(mrd.Cluster)
 	if err != nil {
 		return nil, err
 	}
-	mrd.clientObject = clientObject
 
-	mrd.PVC = getDestinationPVC(cmd, mrd)
-	if mrd.PVC == nil {
+	mc.PVC = getDestinationPVC(mc, mrd)
+	if mc.PVC == nil {
 		cap, err := cmd.Flags().GetString("capacity")
 		if err != nil || cap == "" {
-			klog.Infof("please provide capacity or provide name of exiting pvc, err: %v", err)
-			return nil, fmt.Errorf("please provide capacity or provide name of exiting pvc, err: %w", err)
+			return nil, fmt.Errorf("please provide the capacity or create a PVC by name: %s", mrd.PVCName)
 		}
 		capacity, _ := resource.ParseQuantity(cap)
 		mrd.Destination.Capacity = &capacity
 
 		accessMode, err := cmd.Flags().GetString("accessmodes")
-		if err != nil || accessMode == "" {
-			klog.Info("access mode not provided, defaulting to accessMode: \"ReadWriteOnce\"")
-			accessMode = "ReadWriteOnce"
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch access mode, %w", err)
 		}
 
 		if v1.PersistentVolumeAccessMode(accessMode) != v1.ReadWriteOnce &&
 			v1.PersistentVolumeAccessMode(accessMode) != v1.ReadOnlyMany &&
 			v1.PersistentVolumeAccessMode(accessMode) != v1.ReadWriteMany &&
 			v1.PersistentVolumeAccessMode(accessMode) != v1.ReadWriteOncePod {
-			klog.Infof("unsupported access mode: %v", accessMode)
 			return nil, fmt.Errorf("unsupported access mode: %v", accessMode)
 		}
 		accessModes := []v1.PersistentVolumeAccessMode{v1.PersistentVolumeAccessMode(accessMode)}
@@ -201,37 +196,36 @@ func newMigrationRelationshipDestination(cmd *cobra.Command) (*migrationRelation
 		if err != nil || storageClass == "" {
 			klog.Infof("storage class not provided, binding to default storage class")
 		}
-
 		mrd.Destination.StorageClassName = &storageClass
+	} else {
+		mrd.Destination.Capacity = mc.PVC.Spec.Resources.Requests.Storage()
+		mrd.Destination.AccessModes = mc.PVC.Spec.AccessModes
+		mrd.Destination.StorageClassName = mc.PVC.Spec.StorageClassName
+		mrd.Cluster = mc.PVC.ClusterName
 	}
 
 	serviceType, err := cmd.Flags().GetString("servicetype")
 	if err != nil {
-		klog.Infof("please provide service type, err = %v", err)
 		return nil, fmt.Errorf("please provide service type, err = %w", err)
 	}
 
 	if v1.ServiceType(serviceType) != v1.ServiceTypeClusterIP &&
-		v1.ServiceType(serviceType) != v1.ServiceTypeNodePort &&
 		v1.ServiceType(serviceType) != v1.ServiceTypeLoadBalancer {
-		klog.Infof("unsupported service type: %v", v1.ServiceType(serviceType))
 		return nil, fmt.Errorf("unsupported service type: %v", v1.ServiceType(serviceType))
 	}
 	mrd.Destination.ServiceType = (*v1.ServiceType)(&serviceType)
-
 	mrd.MDName = mrd.Namespace + "-" + mrd.PVCName + "-migration-dest"
 
 	return mrd, nil
 }
 
-func createNamespace(ctx context.Context, mrd *migrationRelationshipDestination) error {
+func createNamespace(mc *migrationCreate, mrd *migrationRelationshipDestination) error {
 	ns := &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: mrd.Namespace,
 		},
 	}
-
-	if err := mrd.clientObject.Create(ctx, ns); err != nil {
+	if err := mc.clientObject.Create(mc.Context(), ns); err != nil {
 		if kerrs.IsAlreadyExists(err) {
 			klog.Infof("Namespace: \"%s\" already present, proceeding with this namespace",
 				mrd.Namespace)
@@ -240,10 +234,11 @@ func createNamespace(ctx context.Context, mrd *migrationRelationshipDestination)
 		return err
 	}
 	klog.Infof("Created destination namespace: \"%s\"", mrd.Namespace)
+
 	return nil
 }
 
-func createDestinationPVC(ctx context.Context,
+func createDestinationPVC(mc *migrationCreate,
 	mrd *migrationRelationshipDestination) (*v1.PersistentVolumeClaim, error) {
 	var destPVC *v1.PersistentVolumeClaim
 	if *mrd.Destination.StorageClassName == "" {
@@ -278,24 +273,24 @@ func createDestinationPVC(ctx context.Context,
 			},
 		}
 	}
-
-	if err := mrd.clientObject.Create(ctx, destPVC); err != nil {
+	if err := mc.clientObject.Create(mc.Context(), destPVC); err != nil {
 		return nil, err
 	}
-
+	mrd.Destination.StorageClassName = destPVC.Spec.StorageClassName
 	klog.Infof("Created destination PVC: \"%s\"", mrd.PVCName)
+
 	return destPVC, nil
 }
 
-func getDestinationPVC(cmd *cobra.Command, mrd *migrationRelationshipDestination) *v1.PersistentVolumeClaim {
+func getDestinationPVC(mc *migrationCreate, mrd *migrationRelationshipDestination) *v1.PersistentVolumeClaim {
+	cmd := mc.Command
 	// Search for preexisting PVC
 	destPVC := &v1.PersistentVolumeClaim{}
 	pvcInfo := types.NamespacedName{
 		Namespace: mrd.Namespace,
 		Name:      mrd.PVCName,
 	}
-
-	err := mrd.clientObject.Get(cmd.Context(), pvcInfo, destPVC)
+	err := mc.clientObject.Get(cmd.Context(), pvcInfo, destPVC)
 	if err == nil {
 		return destPVC
 	}
@@ -303,7 +298,7 @@ func getDestinationPVC(cmd *cobra.Command, mrd *migrationRelationshipDestination
 	return nil
 }
 
-func CreateDestination(ctx context.Context, mrd *migrationRelationshipDestination) error {
+func createDestination(mc *migrationCreate, mrd *migrationRelationshipDestination) error {
 	rsyncSpec := &volsyncv1alpha1.ReplicationDestinationRsyncSpec{
 		ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
 			CopyMethod:     mrd.Destination.CopyMethod,
@@ -311,7 +306,6 @@ func CreateDestination(ctx context.Context, mrd *migrationRelationshipDestinatio
 		},
 		ServiceType: mrd.Destination.ServiceType,
 	}
-
 	rd := &volsyncv1alpha1.ReplicationDestination{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mrd.MDName,
@@ -321,9 +315,43 @@ func CreateDestination(ctx context.Context, mrd *migrationRelationshipDestinatio
 			Rsync: rsyncSpec,
 		},
 	}
-	if err := mrd.clientObject.Create(ctx, rd); err != nil {
+	if err := mc.clientObject.Create(mc.Context(), rd); err != nil {
 		return err
 	}
+
+	// wait for migrationdestination to become ready
+	nsName := types.NamespacedName{
+		Namespace: mrd.Namespace,
+		Name:      mrd.MDName,
+	}
+	rd = &volsyncv1alpha1.ReplicationDestination{}
+	err := wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
+		err := mc.clientObject.Get(mc.Context(), nsName, rd)
+		if err != nil {
+			return false, err
+		}
+		if rd.Status == nil {
+			return false, nil
+		}
+		if rd.Status.Rsync.Address == nil {
+			klog.Infof("Waiting for MigrationDestination %s RSync address to populate", rd.Name)
+			return false, nil
+		}
+
+		if rd.Status.Rsync.SSHKeys == nil {
+			klog.Infof("Waiting for MigrationDestination %s RSync sshkeys to populate", rd.Name)
+			return false, nil
+		}
+
+		klog.Infof("Found MigrationDestination RSync Address: %s", *rd.Status.Rsync.Address)
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	mrd.Destination.Address = rd.Status.Rsync.Address
+	mrd.Destination.Port = rd.Status.Rsync.Port
+	mrd.Destination.SSHKeys = rd.Status.Rsync.SSHKeys
 	klog.Infof("ReplicationDestination: \"%s\" created in namespace: \"%s\"", mrd.MDName, mrd.Namespace)
 
 	return nil
