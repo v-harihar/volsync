@@ -17,6 +17,7 @@ along with this program. If not, see <http://www.gnu.org/licenses/>.
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -36,10 +37,11 @@ import (
 )
 
 type migrationCreate struct {
-	cobra.Command
-	// client object associated with a cluster
+	// migration relationship object to be persisted to a config file
+	mr *migrationRelationship
+	// client object to communicate with a cluster
 	clientObject client.Client
-	// PVC object associated with pvcName
+	// PVC object associated with pvcName used to create destination object
 	PVC *v1.PersistentVolumeClaim
 }
 
@@ -55,10 +57,11 @@ var migrationCreateCmd = &cobra.Command{
 	to accept incoming transfers via rsync over ssh.
 	`)),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		r := &migrationCreate{
-			Command: *cmd,
+		mc, err := newMigrationCreate(cmd)
+		if err != nil {
+			return err
 		}
-		return r.Run()
+		return mc.Run(cmd.Context())
 	},
 	Args: validateMigrationCreate,
 }
@@ -70,7 +73,7 @@ func init() {
 		"Copy method used to copy the data from source to destination PVC viz: Direct, Snapshot")
 	migrationCreateCmd.Flags().String("accessmodes", "ReadWriteOnce",
 		"accessMode of the PVC to create. viz: ReadWriteOnce, ReadOnlyMany, ReadWriteMany, ReadWriteOncePod")
-	migrationCreateCmd.Flags().String("capacity", "", "size of the PVC to create in Gi ex: 10Gi")
+	migrationCreateCmd.Flags().String("capacity", "", "size of the PVC to create (ex: 100Mi, 10Gi, 2Ti)")
 	migrationCreateCmd.Flags().String("pvcname", "", "name of the PVC to create or use: [context/]namespace/name")
 	cobra.CheckErr(migrationCreateCmd.MarkFlagRequired("pvcname"))
 	migrationCreateCmd.Flags().String("storageclass", "", "StorageClass name for the PVC")
@@ -101,46 +104,29 @@ func validateMigrationCreate(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func (cmd *migrationCreate) Run() error {
+func newMigrationCreate(cmd *cobra.Command) (*migrationCreate, error) {
+	mc := &migrationCreate{}
 	// build struct migrationRelationship from cmd line args
-	m, err := newmigrationRelationship(&cmd.Command)
+	mr, err := newmigrationRelationship(cmd)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	mc.mr = mr
 	// build struct migrationRelationshipDestination from cmd line args
-	mrd, err := newMigrationRelationshipDestination(cmd)
+	mrd, err := newMigrationRelationshipDestination(mc, cmd)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// create namespace if does not exist
-	err = createNamespace(cmd, mrd)
-	if err != nil {
-		return err
-	}
-	// create destination PVC if does not exist
-	if cmd.PVC == nil {
-		cmd.PVC, err = createDestinationPVC(cmd, mrd)
-		if err != nil {
-			return err
-		}
-	}
-	// create migration destination
-	err = createDestination(cmd, mrd)
-	if err != nil {
-		return err
-	}
-	// save the destination details into config file
-	m.data.Destination = mrd
-	if err = m.Save(); err != nil {
-		return fmt.Errorf("unable to save relationship configuration: %w", err)
-	}
-	return nil
+	mc.mr.data.Destination = mrd
+
+	return mc, nil
 }
 
 //nolint:funlen
-func newMigrationRelationshipDestination(mc *migrationCreate) (*migrationRelationshipDestination, error) {
-	cmd := &mc.Command
+func newMigrationRelationshipDestination(mc *migrationCreate,
+	cmd *cobra.Command) (*migrationRelationshipDestination, error) {
 	mrd := &migrationRelationshipDestination{}
+	mc.mr.data.Destination = mrd
 
 	cm, err := cmd.Flags().GetString("copymethod")
 	if err != nil {
@@ -169,7 +155,7 @@ func newMigrationRelationshipDestination(mc *migrationCreate) (*migrationRelatio
 		return nil, err
 	}
 
-	mc.PVC = getDestinationPVC(mc, mrd)
+	mc.PVC = mc.getDestinationPVC(cmd.Context())
 	if mc.PVC == nil {
 		cap, err := cmd.Flags().GetString("capacity")
 		if err != nil || cap == "" {
@@ -219,13 +205,39 @@ func newMigrationRelationshipDestination(mc *migrationCreate) (*migrationRelatio
 	return mrd, nil
 }
 
-func createNamespace(mc *migrationCreate, mrd *migrationRelationshipDestination) error {
+func (mc *migrationCreate) Run(ctx context.Context) error {
+	// create namespace if does not exist
+	err := mc.createNamespace(ctx)
+	if err != nil {
+		return err
+	}
+	// create destination PVC if does not exist
+	if mc.PVC == nil {
+		mc.PVC, err = mc.createDestinationPVC(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	// create migration destination
+	err = mc.createDestination(ctx)
+	if err != nil {
+		return err
+	}
+	// save the destination details into config file
+	if err = mc.mr.Save(); err != nil {
+		return fmt.Errorf("unable to save relationship configuration: %w", err)
+	}
+	return nil
+}
+
+func (mc *migrationCreate) createNamespace(ctx context.Context) error {
+	mrd := mc.mr.data.Destination
 	ns := &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: mrd.Namespace,
 		},
 	}
-	if err := mc.clientObject.Create(mc.Context(), ns); err != nil {
+	if err := mc.clientObject.Create(ctx, ns); err != nil {
 		if kerrs.IsAlreadyExists(err) {
 			klog.Infof("Namespace: \"%s\" already present, proceeding with this namespace",
 				mrd.Namespace)
@@ -238,9 +250,10 @@ func createNamespace(mc *migrationCreate, mrd *migrationRelationshipDestination)
 	return nil
 }
 
-func createDestinationPVC(mc *migrationCreate,
-	mrd *migrationRelationshipDestination) (*v1.PersistentVolumeClaim, error) {
+func (mc *migrationCreate) createDestinationPVC(ctx context.Context) (*v1.PersistentVolumeClaim, error) {
+	mrd := mc.mr.data.Destination
 	var destPVC *v1.PersistentVolumeClaim
+
 	if *mrd.Destination.StorageClassName == "" {
 		destPVC = &v1.PersistentVolumeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -273,7 +286,7 @@ func createDestinationPVC(mc *migrationCreate,
 			},
 		}
 	}
-	if err := mc.clientObject.Create(mc.Context(), destPVC); err != nil {
+	if err := mc.clientObject.Create(ctx, destPVC); err != nil {
 		return nil, err
 	}
 	mrd.Destination.StorageClassName = destPVC.Spec.StorageClassName
@@ -282,15 +295,14 @@ func createDestinationPVC(mc *migrationCreate,
 	return destPVC, nil
 }
 
-func getDestinationPVC(mc *migrationCreate, mrd *migrationRelationshipDestination) *v1.PersistentVolumeClaim {
-	cmd := mc.Command
-	// Search for preexisting PVC
+func (mc *migrationCreate) getDestinationPVC(ctx context.Context) *v1.PersistentVolumeClaim {
+	mrd := mc.mr.data.Destination
 	destPVC := &v1.PersistentVolumeClaim{}
 	pvcInfo := types.NamespacedName{
 		Namespace: mrd.Namespace,
 		Name:      mrd.PVCName,
 	}
-	err := mc.clientObject.Get(cmd.Context(), pvcInfo, destPVC)
+	err := mc.clientObject.Get(ctx, pvcInfo, destPVC)
 	if err == nil {
 		return destPVC
 	}
@@ -298,7 +310,8 @@ func getDestinationPVC(mc *migrationCreate, mrd *migrationRelationshipDestinatio
 	return nil
 }
 
-func createDestination(mc *migrationCreate, mrd *migrationRelationshipDestination) error {
+func (mc *migrationCreate) createDestination(ctx context.Context) error {
+	mrd := mc.mr.data.Destination
 	rsyncSpec := &volsyncv1alpha1.ReplicationDestinationRsyncSpec{
 		ReplicationDestinationVolumeOptions: volsyncv1alpha1.ReplicationDestinationVolumeOptions{
 			CopyMethod:     mrd.Destination.CopyMethod,
@@ -315,7 +328,7 @@ func createDestination(mc *migrationCreate, mrd *migrationRelationshipDestinatio
 			Rsync: rsyncSpec,
 		},
 	}
-	if err := mc.clientObject.Create(mc.Context(), rd); err != nil {
+	if err := mc.clientObject.Create(ctx, rd); err != nil {
 		return err
 	}
 
@@ -326,7 +339,7 @@ func createDestination(mc *migrationCreate, mrd *migrationRelationshipDestinatio
 	}
 	rd = &volsyncv1alpha1.ReplicationDestination{}
 	err := wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
-		err := mc.clientObject.Get(mc.Context(), nsName, rd)
+		err := mc.clientObject.Get(ctx, nsName, rd)
 		if err != nil {
 			return false, err
 		}
