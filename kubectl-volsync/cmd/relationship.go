@@ -25,6 +25,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"gopkg.in/yaml.v2"
 	"k8s.io/klog/v2"
 )
 
@@ -141,4 +142,19 @@ func (r *Relationship) Type() RelationshipType {
 // ID returns the UUID of this relationship.
 func (r *Relationship) ID() uuid.UUID {
 	return uuid.MustParse(r.GetString("id"))
+}
+
+// Sets the "data" subkey with the contents of a struct and flattens it so that
+// individual values may be overridden
+func (r *Relationship) SetData(data interface{}) error {
+	bytes, err := yaml.Marshal(data)
+	if err != nil {
+		return err
+	}
+	ms := map[string]interface{}{}
+	if err = yaml.Unmarshal(bytes, &ms); err != nil {
+		return err
+	}
+	r.Set("data", ms)
+	return nil
 }

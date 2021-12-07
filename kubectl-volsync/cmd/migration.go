@@ -58,26 +58,14 @@ type migrationRelationshipDestination struct {
 }
 
 func (mr *migrationRelationship) Save() error {
-	mr.Set("data", mr.data)
-	// resource.Quantity doesn't properly encode, so we need to do it manually.
-	// TODO: Find a solution for below behavior to avoid multiple mr.Set() statements.
-	// If we set capacity explicitly, it will override mr.set("data", mr.data)
-	// behavior and only capacity will be set. So resetting every other fields
-	// explicitly.
-	if mr.data.Destination != nil && mr.data.Destination.Destination.Capacity != nil {
-		mr.Set("data.destination.spec.Capacity", mr.data.Destination.Destination.Capacity.String())
-		mr.Set("data.destination.Cluster", mr.data.Destination.Cluster)
-		mr.Set("data.destination.Namespace", mr.data.Destination.Namespace)
-		mr.Set("data.destination.PVCName", mr.data.Destination.PVCName)
-		mr.Set("data.destination.MDName", mr.data.Destination.MDName)
-		mr.Set("data.destination.spec.ServiceType", mr.data.Destination.Destination.ServiceType)
-		mr.Set("data.destination.spec.AccessModes", mr.data.Destination.Destination.AccessModes)
-		mr.Set("data.destination.spec.CopyMethod", mr.data.Destination.Destination.CopyMethod)
+	if err := mr.SetData(mr.data); err != nil {
+		return err
+	}
 
-		mr.Set("data.destination.spec.StorageClassName", mr.data.Destination.Destination.StorageClassName)
-		mr.Set("data.destination.rsync.Address", mr.data.Destination.Destination.Address)
-		mr.Set("data.destination.rsync.Port", mr.data.Destination.Destination.Port)
-		mr.Set("data.destination.rsync.SSHKeys", mr.data.Destination.Destination.SSHKeys)
+	// resource.Quantity doesn't properly encode, so we need to do it manually.
+	if mr.data.Destination != nil && mr.data.Destination.Destination.Capacity != nil {
+		mr.Set("data.destination.destination.replicationdestinationvolumeoptions.capacity",
+			mr.data.Destination.Destination.Capacity.String())
 	}
 
 	return mr.Relationship.Save()
